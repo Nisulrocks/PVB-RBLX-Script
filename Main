@@ -192,61 +192,90 @@ function AutoBuyer:BuyItem(item)
     local actualPurchases = 0
 
     if stock > 0 then
-        local priceNumber = tonumber(price) or 0
-        local originalStock = stock
-        local maxRetries = 3
+        local attempts = stock
+        -- Baselines for aggregate fallback confirmation
+        local moneyBaseline = (Statistics and Statistics.GetCurrentMoney and Statistics:GetCurrentMoney()) or nil
+        local spentBaseline = (Statistics and Statistics.spent) or 0
+        local stockBaseline = tonumber(item:GetAttribute("Stock")) or stock
+        for i = 1, attempts do
+            -- Snapshot before
+            local moneyBefore = (Statistics and Statistics.GetCurrentMoney and Statistics:GetCurrentMoney()) or nil
+            local spentBefore = (Statistics and Statistics.spent) or 0
+            local stockBefore = tonumber(item:GetAttribute("Stock")) or 0
 
-        for attempt = 1, maxRetries do
-            local remaining = tonumber(item:GetAttribute("Stock")) or 0
-            if remaining <= 0 then break end
+            -- Fire once
+            local firedOk = Utils.SafeFireServer(self.buyRemote, item.Name, true)
+            if not firedOk then break end
 
-            -- Fire for current remaining stock
-            for i = 1, remaining do
-                Utils.SafeFireServer(self.buyRemote, item.Name, true)
-                task.wait(self.buyDelay)
+            -- Poll up to 6s for any confirmation: money down OR spent up OR stock down
+            local confirmed = false
+            local waited = 0
+            local maxWait = 6.0
+            local step = math.max(0.05, self.buyDelay)
+            while waited < maxWait do
+                task.wait(step)
+                waited = waited + step
+                local moneyNow = (Statistics and Statistics.GetCurrentMoney and Statistics:GetCurrentMoney()) or moneyBefore
+                local spentNow = (Statistics and Statistics.spent) or spentBefore
+                local stockNow = tonumber(item:GetAttribute("Stock")) or stockBefore
+
+                local moneyDelta = (moneyBefore and moneyNow) and (moneyBefore - moneyNow) or 0
+                local spentDelta = (spentNow - spentBefore)
+                local stockDelta = stockBefore - stockNow
+
+                if (moneyDelta and moneyDelta > 0) or (spentDelta and spentDelta > 0) or (stockDelta and stockDelta > 0) then
+                    confirmed = true
+                    break
+                end
             end
 
-            -- Grace period to allow server replication (longer window)
-            local graceTotal = 3.5
+            if confirmed then
+                actualPurchases = actualPurchases + 1
+            else
+                -- Not confirmed yet; continue attempts and rely on aggregate fallback below
+            end
+        end
+
+        -- Final grace wait before aggregate reconciliation
+        do
+            local extraWait = 2.0
             local step = math.max(0.05, self.buyDelay)
             local waited = 0
-            while waited < graceTotal do
+            while waited < extraWait do
                 task.wait(step)
-                waited += step
+                waited = waited + step
             end
+        end
 
-            -- Compute delta since this attempt
-            local moneyNow = (Statistics and Statistics.GetCurrentMoney and Statistics:GetCurrentMoney()) or nil
-            local stockNow = tonumber(item:GetAttribute("Stock")) or remaining
-
-            local confirmedThisAttempt = 0
-            if priceNumber > 0 and moneyNow ~= nil then
-                -- Approximate purchases from total spent since last attempt boundary
-                -- We don't know the exact boundary money, so infer from remaining vs before if price checks fail
-                -- Prefer stock delta if it decreased
-                local newRemaining = stockNow
-                if newRemaining < remaining then
-                    confirmedThisAttempt = remaining - newRemaining
-                else
-                    -- Fallback: estimate via money delta over price (best-effort)
-                    -- Note: Without a precise per-attempt money baseline, we cannot isolate per-attempt spend reliably
-                    -- so we skip money-based inference here to avoid overcounting.
-                end
-            else
-                -- Free items: use stock delta
-                if stockNow < remaining then
-                    confirmedThisAttempt = remaining - stockNow
+        -- Aggregate reconciliation: compute total confirmed from baselines
+        local moneyAfter = (Statistics and Statistics.GetCurrentMoney and Statistics:GetCurrentMoney()) or moneyBaseline
+        local spentAfter = (Statistics and Statistics.spent) or spentBaseline
+        local stockAfter = tonumber(item:GetAttribute("Stock")) or stockBaseline
+        local inferredByMoney = 0
+        local inferredBySpent = 0
+        local inferredByStock = 0
+        local priceNum = tonumber(price) or 0
+        if priceNum > 0 then
+            if moneyBaseline and moneyAfter then
+                local moneyDelta = (moneyBaseline - moneyAfter)
+                if moneyDelta and moneyDelta > 0 then
+                    inferredByMoney = math.floor((moneyDelta + 1e-6) / priceNum)
                 end
             end
-
-            -- Clamp and accumulate
-            confirmedThisAttempt = math.max(0, math.min(confirmedThisAttempt, remaining))
-            actualPurchases = actualPurchases + confirmedThisAttempt
-
-            -- Stop conditions: no progress or nothing left
-            if confirmedThisAttempt == 0 or actualPurchases >= originalStock or stockNow <= 0 then
-                break
+            if spentAfter and spentBaseline then
+                local spentDelta = (spentAfter - spentBaseline)
+                if spentDelta and spentDelta > 0 then
+                    inferredBySpent = math.floor((spentDelta + 1e-6) / priceNum)
+                end
             end
+        else
+            if stockBaseline and stockAfter and stockAfter <= stockBaseline then
+                inferredByStock = math.max(0, stockBaseline - stockAfter)
+            end
+        end
+        local addedByAggregate = math.max(inferredByMoney, inferredBySpent, inferredByStock)
+        if addedByAggregate > actualPurchases then
+            actualPurchases = addedByAggregate
         end
     end
     
