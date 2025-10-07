@@ -2,6 +2,7 @@
 -- Modular, Optimized, Feature-Rich
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local PathfindingService = game:GetService("PathfindingService")
@@ -11,10 +12,12 @@ local Remotes = ReplicatedStorage:WaitForChild("Remotes")
 local BuyItemRemote = Remotes:WaitForChild("BuyItem")
 local BuyGearRemote = Remotes:WaitForChild("BuyGear")
 local AttacksRemote = Remotes:WaitForChild("AttacksServer"):WaitForChild("WeaponAttack")
+local EquipBestBrainrotsRemote = Remotes:WaitForChild("EquipBestBrainrots")
 
 -- Assets
 local SeedsFolder = ReplicatedStorage:WaitForChild("Assets"):WaitForChild("Seeds")
 local GearsFolder = ReplicatedStorage:WaitForChild("Assets"):WaitForChild("Gears")
+local BatsFolder = ReplicatedStorage:WaitForChild("Assets"):WaitForChild("Bats")
 local Brainrots = workspace:WaitForChild("ScriptedMap"):WaitForChild("Brainrots")
 
 -- Player
@@ -22,16 +25,12 @@ local LocalPlayer = Players.LocalPlayer
 local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
 local HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
 local Humanoid = Character:WaitForChild("Humanoid")
+local function getBackpack()
+    return LocalPlayer:FindFirstChild("Backpack")
+end
 
 -- Update character references on respawn
-LocalPlayer.CharacterAdded:Connect(function(char)
-	Character = char
-	HumanoidRootPart = char:WaitForChild("HumanoidRootPart")
-	Humanoid = char:WaitForChild("Humanoid")
-end)
-
 -----------------------
--- UTILITY MODULE
 -----------------------
 local Utils = {}
 
@@ -132,7 +131,6 @@ local function GetSeedProbability(seedName)
 	return 1
 end
 
------------------------
 -- AUTO BUYER MODULE
 -----------------------
 local AutoBuyer = {}
@@ -158,59 +156,94 @@ function AutoBuyer.new(itemType, folder, buyRemote, buyDelay)
 end
 
 function AutoBuyer:GetItems()
-	if self.itemType == "seed" then
-		return Utils.GetVisibleSeeds()
-	else
-		return Utils.GetShopGears()
-	end
+    if self.itemType == "seed" then
+        return Utils.GetVisibleSeeds()
+    else
+        return Utils.GetShopGears()
+    end
 end
 
 function AutoBuyer:DeterminePurchaseList()
-	local items = {}
-	
-	if self.modes.all then
-		items = self:GetItems()
-	elseif self.modes.best then
-		items = Utils.GetTopItems(self:GetItems(), self.topCount)
-	elseif self.modes.selected then
-		for _, name in ipairs(self.selectedItems) do
-			local inst = self.folder:FindFirstChild(name)
-			if inst then
-				if self.itemType == "seed" and not inst:GetAttribute("Hidden") then
-					table.insert(items, inst)
-				elseif self.itemType == "gear" and inst:GetAttribute("Price") ~= nil then
-					table.insert(items, inst)
-				end
-			end
-		end
-	end
-	
-	return items
+    local items = {}
+    
+    if self.modes.all then
+        items = self:GetItems()
+    elseif self.modes.best then
+        items = Utils.GetTopItems(self:GetItems(), self.topCount)
+    elseif self.modes.selected then
+        for _, name in ipairs(self.selectedItems) do
+            local inst = self.folder:FindFirstChild(name)
+            if inst then
+                if self.itemType == "seed" and not inst:GetAttribute("Hidden") then
+                    table.insert(items, inst)
+                elseif self.itemType == "gear" and inst:GetAttribute("Price") ~= nil then
+                    table.insert(items, inst)
+                end
+            end
+        end
+    end
+    return items
 end
 
 function AutoBuyer:BuyItem(item)
-	local stock = item:GetAttribute("Stock") or 0
-	local price = item:GetAttribute("Price") or 0
-	
-	local actualPurchases = 0
-	
-	if stock > 0 then
-		for i = 1, stock do
-			local success = Utils.SafeFireServer(self.buyRemote, item.Name, true)
-			if success then
-				actualPurchases = actualPurchases + 1
-			end
-			task.wait(self.buyDelay)
-		end
-	end
-	
-	-- Only increment counters if we actually made purchases
-	if actualPurchases > 0 then
-		self.purchaseCount = self.purchaseCount + actualPurchases
-		self.totalSpent = self.totalSpent + (price * actualPurchases)
-	end
-	
-	return actualPurchases
+    local stock = item:GetAttribute("Stock") or 0
+    local price = item:GetAttribute("Price") or 0
+    
+    local actualPurchases = 0
+    
+    if stock > 0 then
+        for i = 1, stock do
+            local priceNumber = tonumber(price) or 0
+            local moneyBefore, stockBefore
+            if Statistics and Statistics.GetCurrentMoney then
+                moneyBefore = Statistics:GetCurrentMoney()
+            end
+            stockBefore = tonumber(item:GetAttribute("Stock")) or 0
+
+            local success = Utils.SafeFireServer(self.buyRemote, item.Name, true)
+
+            task.wait(self.buyDelay)
+
+            local confirmed = false
+            if success then
+                -- Confirm by money delta for paid items
+                if priceNumber > 0 and moneyBefore ~= nil and Statistics and Statistics.GetCurrentMoney then
+                    local moneyAfter = Statistics:GetCurrentMoney()
+                    local spentDelta = (moneyBefore - moneyAfter)
+                    if spentDelta >= priceNumber then
+                        confirmed = true
+                    end
+                else
+                    -- Free items: confirm by stock decreasing
+                    local stockAfter = tonumber(item:GetAttribute("Stock")) or stockBefore
+                    if stockAfter < stockBefore then
+                        confirmed = true
+                    end
+                end
+            end
+
+            if confirmed then
+                actualPurchases = actualPurchases + 1
+            else
+                -- No confirmation: likely out of stock or failed. Stop trying this item.
+                break
+            end
+        end
+    end
+    
+    -- Only increment counters if we actually made purchases
+    if actualPurchases > 0 then
+        self.purchaseCount = self.purchaseCount + actualPurchases
+        self.totalSpent = self.totalSpent + (price * actualPurchases)
+        -- Record seed purchases for dashboard/webhook stats (guarded)
+        if self.itemType == "seed" then
+            if Statistics and Statistics.RecordSeedPurchase then
+                Statistics:RecordSeedPurchase(item.Name, actualPurchases)
+            end
+        end
+    end
+    
+    return actualPurchases
 end
 
 function AutoBuyer:Start()
@@ -276,6 +309,7 @@ function AutoCombat.new()
 	self.originalColors = {}
 	self.weaponSlot = 1
 	self.equippedTool = nil
+	self.currentToolName = "None"
 	return self
 end
 
@@ -328,10 +362,58 @@ function AutoCombat:RemoveHighlight()
 	self.originalColors = {}
 end
 
+-- (Removed) ResolveHealthAttribute no longer used
+
+function AutoCombat:GetOwnedCombatTool()
+	-- Build a set of valid tool names from ReplicatedStorage.Assets.Bats
+	local validNames = {}
+	for _, tool in ipairs(BatsFolder:GetChildren()) do
+		validNames[tool.Name] = true
+	end
+
+	-- Check character (already equipped)
+	for _, t in ipairs(Character:GetChildren()) do
+		if t:IsA("Tool") and validNames[t.Name] then
+			return t
+		end
+	end
+
+	-- Then check backpack
+	local backpack = LocalPlayer:FindFirstChild("Backpack")
+	if backpack then
+		for _, t in ipairs(backpack:GetChildren()) do
+			if t:IsA("Tool") and validNames[t.Name] then
+				return t
+			end
+		end
+	end
+
+	return nil
+end
+
+function AutoCombat:AutoEquipTool()
+	local tool = self:GetOwnedCombatTool()
+	if tool then
+		self.currentToolName = tool.Name
+		self.equippedTool = tool
+		pcall(function()
+			if Humanoid and Humanoid.Parent then
+				Humanoid:EquipTool(tool)
+			else
+				tool.Parent = Character
+			end
+		end)
+		return true
+	end
+	self.currentToolName = "None"
+	self.equippedTool = nil
+	return false
+end
+
 function AutoCombat:MoveToTarget(target)
 	local targetHRP = target:FindFirstChild("HumanoidRootPart") or target.PrimaryPart
 	if not targetHRP then return end
-	
+
 	task.spawn(function()
 		while self.enabled and target.Parent do
 			Humanoid:MoveTo(targetHRP.Position)
@@ -344,32 +426,36 @@ function AutoCombat:Start()
 	if self.running then return end
 	self.running = true
 	self.enabled = true
-	
+
+	-- Equip immediately
+	self:AutoEquipTool()
+
 	task.spawn(function()
 		local lastEnemy = nil
 		while self.enabled do
+			-- Ensure tool stays equipped
+			if not self.equippedTool or self.equippedTool.Parent ~= Character then
+				self:AutoEquipTool()
+			end
+
 			local enemy = self:GetNearestEnemy()
-			
+
 			-- Update current target for stats display
 			self.currentTarget = enemy
-			
+
 			if enemy ~= lastEnemy then
 				lastEnemy = enemy
 				self:HighlightEnemy(enemy)
 			end
-			
 			if enemy then
 				self:MoveToTarget(enemy)
 				local enemyHRP = enemy:FindFirstChild("HumanoidRootPart") or enemy.PrimaryPart
-				
+
 				if enemyHRP then
-					-- Track the enemy we're attacking
-					local attackingEnemy = enemy
-					
 					while enemy.Parent and self.enabled and enemyHRP.Parent do
 						local distance = (HumanoidRootPart.Position - enemyHRP.Position).Magnitude
 						if distance > self.attackRange then break end
-						
+
 						pcall(function()
 							AttacksRemote:FireServer({enemy.Name})
 						end)
@@ -381,17 +467,17 @@ function AutoCombat:Start()
 				self:RemoveHighlight()
 				lastEnemy = nil
 			end
-			
+
 			-- Ensure highlight respects toggle even while moving
 			if self.highlightEnabled and lastEnemy then
 				self:HighlightEnemy(lastEnemy)
 			else
 				self:RemoveHighlight()
 			end
-			
+
 			task.wait(0.1)
 		end
-		
+
 		self.running = false
 		self.currentTarget = nil
 		self:RemoveHighlight()
@@ -408,28 +494,100 @@ function AutoCombat:GetStats()
 		target = self.currentTarget
 	}
 end
-
+--- STATISTICS TRACKER
 -----------------------
--- STATISTICS TRACKER
------------------------
-local Statistics = {
-	sessionStart = tick()
+Statistics = {
+    sessionStart = tick(),
+    startingMoney = nil,
+    lastMoney = nil,
+    spent = 0,
+    gained = 0,
+    seedPurchases = {},
 }
 
+function Statistics:InitMoneyTracker()
+    local leaderstats = LocalPlayer:FindFirstChild("leaderstats") or LocalPlayer:WaitForChild("leaderstats")
+    local moneyVal = leaderstats and (leaderstats:FindFirstChild("Money") or leaderstats:WaitForChild("Money"))
+    if moneyVal and moneyVal.Value ~= nil then
+        self.startingMoney = tonumber(moneyVal.Value) or 0
+        self.lastMoney = self.startingMoney
+    else
+        self.startingMoney = 0
+        self.lastMoney = 0
+    end
+end
+
+function Statistics:GetCurrentMoney()
+    local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
+    local moneyVal = leaderstats and leaderstats:FindFirstChild("Money")
+    if moneyVal and moneyVal.Value ~= nil then
+        return tonumber(moneyVal.Value) or 0
+    end
+    return 0
+end
+
+function Statistics:RecordSeedPurchase(name, count)
+    if not name or name == "" then return end
+    count = tonumber(count) or 1
+    self.seedPurchases[name] = (self.seedPurchases[name] or 0) + count
+end
+
+function Statistics:GetSeedPurchasesSummary(limit)
+    limit = limit or 10
+    local entries = {}
+    for k, v in pairs(self.seedPurchases) do
+        table.insert(entries, {name = k, count = v})
+    end
+    table.sort(entries, function(a,b) return a.count > b.count end)
+    if #entries == 0 then return "Seeds Bought: None" end
+    local lines = {"Seeds Bought (top "..math.min(limit, #entries).."):"}
+    for i = 1, math.min(limit, #entries) do
+        local e = entries[i]
+        table.insert(lines, string.format("- %s: %d", e.name, e.count))
+    end
+    return table.concat(lines, "\n")
+end
+
+function Statistics:UpdateMoney()
+    if self.startingMoney == nil then
+        self:InitMoneyTracker()
+        return
+    end
+    local current = self:GetCurrentMoney()
+    if self.lastMoney ~= nil then
+        local delta = current - self.lastMoney
+        if delta > 0 then
+            self.gained = self.gained + delta
+        elseif delta < 0 then
+            self.spent = self.spent + (-delta)
+        end
+    end
+    self.lastMoney = current
+end
+
 function Statistics:GetUptime()
-	local uptime = tick() - self.sessionStart
-	local hours = math.floor(uptime / 3600)
-	local minutes = math.floor((uptime % 3600) / 60)
-	local seconds = math.floor(uptime % 60)
-	return string.format("%02dh %02dm %02ds", hours, minutes, seconds)
+    local uptime = tick() - self.sessionStart
+    local hours = math.floor(uptime / 3600)
+    local minutes = math.floor((uptime % 3600) / 60)
+    local seconds = math.floor(uptime % 60)
+    return string.format("%02dh %02dm %02ds", hours, minutes, seconds)
 end
 
 function Statistics:GenerateReport()
-	return string.format(
-		"Session Stats:\n" ..
-		"Uptime: %s\n",
-		self:GetUptime()
-	)
+    local currentMoney = self:GetCurrentMoney()
+    local base = string.format(
+        "Session Stats:\n" ..
+        "Uptime: %s\n" ..
+        "Current Money: %s\n" ..
+        "Money Spent: %s\n" ..
+        "Money Gained: %s\n",
+        self:GetUptime(),
+        Utils.FormatCurrency(currentMoney),
+        Utils.FormatCurrency(self.spent or 0),
+        Utils.FormatCurrency(self.gained or 0)
+    )
+    local seeds = self:GetSeedPurchasesSummary(10)
+    return base .. seeds
 end
 
 -----------------------
@@ -458,14 +616,16 @@ local StatsParagraph = DashboardTab:CreateParagraph({
 	Content = "Initializing..."
 })
 
--- Update stats every 5 seconds
+-- Update stats every 1 second
 task.spawn(function()
 	while true do
+		-- Track money deltas each tick
+		Statistics:UpdateMoney()
 		StatsParagraph:Set({
 			Title = "Session Statistics",
 			Content = Statistics:GenerateReport()
 		})
-		task.wait(5)
+		task.wait(1)
 	end
 end)
 
@@ -766,16 +926,67 @@ task.spawn(function()
 		if combat.enabled then
 			local targetName = "None"
 			if combat.currentTarget and combat.currentTarget.Parent then
-				targetName = combat.currentTarget.Name
+				local brainName = combat.currentTarget:GetAttribute("Brainrot")
+				targetName = (brainName and tostring(brainName)) or combat.currentTarget.Name
 			end
 			CombatStatsParagraph:Set({
 				Title = "Combat Statistics",
-				Content = string.format("Current Target: %s", targetName)
+				Content = string.format("Tool: %s | Target: %s", combat.currentToolName or "None", targetName)
 			})
 		end
 		task.wait(1)
 	end
 end)
+
+-----------------------
+-- AUTO TAB
+-----------------------
+local AutoTab = Window:CreateTab("Auto", 4483362458)
+local AutoSection = AutoTab:CreateSection("Automatic Actions")
+
+local autoEquip = {
+    enabled = false,
+    delay = 30,
+    running = false,
+}
+
+local AutoEquipDelaySlider = AutoTab:CreateSlider({
+    Name = "Equip Best Brainrots Delay (sec)",
+    Range = {1, 300},
+    Increment = 1,
+    CurrentValue = 30,
+    Flag = "EquipBestDelay",
+    Callback = function(value)
+        autoEquip.delay = value
+    end,
+})
+
+local function StartAutoEquip()
+    if autoEquip.running then return end
+    autoEquip.running = true
+    task.spawn(function()
+        while autoEquip.enabled do
+            -- Fire the remote to equip best brainrots
+            Utils.SafeFireServer(EquipBestBrainrotsRemote)
+            -- Wait for user-configured delay
+            local d = tonumber(autoEquip.delay) or 30
+            task.wait(math.max(0.1, d))
+        end
+        autoEquip.running = false
+    end)
+end
+
+local AutoEquipToggle = AutoTab:CreateToggle({
+    Name = "Auto Equip Best Brainrots",
+    CurrentValue = false,
+    Flag = "AutoEquipBestBrainrots",
+    Callback = function(value)
+        autoEquip.enabled = value
+        if value then
+            StartAutoEquip()
+        end
+    end,
+})
 
 -----------------------
 -- SETTINGS TAB
@@ -784,14 +995,14 @@ local SettingsTab = Window:CreateTab("Settings", 4483362458)
 local SettingsSection = SettingsTab:CreateSection("Configuration")
 
 local SeedDelaySlider = SettingsTab:CreateSlider({
-	Name = "Seed Buy Delay (seconds)",
-	Range = {0.05, 0.5},
-	Increment = 0.01,
-	CurrentValue = 0.08,
-	Flag = "SeedBuyDelay",
-	Callback = function(value)
-		seedBuyer.buyDelay = value
-	end,
+    Name = "Seed Buy Delay (seconds)",
+    Range = {0.05, 0.5},
+    Increment = 0.01,
+    CurrentValue = 0.08,
+    Flag = "SeedBuyDelay",
+    Callback = function(value)
+        seedBuyer.buyDelay = value
+    end,
 })
 
 local GearDelaySlider = SettingsTab:CreateSlider({
@@ -806,24 +1017,183 @@ local GearDelaySlider = SettingsTab:CreateSlider({
 })
 
 local StopAllButton = SettingsTab:CreateButton({
-	Name = "Emergency Stop All",
-	Callback = function()
-		seedBuyer:Stop()
-		gearBuyer:Stop()
-		combat:Stop()
-		Rayfield:Notify({
-			Title = "Emergency Stop",
-			Content = "All auto-farm functions stopped",
-			Duration = 3,
-			Image = 4483362458,
-		})
-	end,
+    Name = "Emergency Stop All",
+    Callback = function()
+        seedBuyer:Stop()
+        gearBuyer:Stop()
+        combat:Stop()
+        -- Visually turn off all toggles
+        pcall(function()
+            if SeedToggleBest then SeedToggleBest:Set(false) end
+            if SeedToggleSelected then SeedToggleSelected:Set(false) end
+            if SeedToggleAll then SeedToggleAll:Set(false) end
+            if GearToggleBest then GearToggleBest:Set(false) end
+            if GearToggleSelected then GearToggleSelected:Set(false) end
+            if GearToggleAll then GearToggleAll:Set(false) end
+            if CombatToggle then CombatToggle:Set(false) end
+            if HighlightToggle then HighlightToggle:Set(false) end
+            if AutoEquipToggle then AutoEquipToggle:Set(false) end
+            if WebhookToggle then WebhookToggle:Set(false) end
+        end)
+        Rayfield:Notify({
+            Title = "Emergency Stop",
+            Content = "All auto-farm functions stopped",
+            Duration = 3,
+            Image = 4483362458,
+        })
+    end,
 })
 
------------------------
--- UPDATE STATISTICS
------------------------
--- Statistics update removed - only uptime tracked now
+-- Discord Webhook Integration
+local WebhookSection = SettingsTab:CreateSection("Discord Webhook")
+
+local Webhook = {
+    url = "",
+    enabled = false,
+    interval = 300,
+    running = false,
+}
+
+-- Readable URL mirror (makes it easier to review long webhook URLs)
+local WebhookUrlParagraph = SettingsTab:CreateParagraph({
+    Title = "Current Webhook URL",
+    Content = "(none)"
+})
+
+local WebhookUrlBox = SettingsTab:CreateInput({
+    Name = "Webhook URL",
+    PlaceholderText = "https://discord.com/api/webhooks/...",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(text)
+        local raw = tostring(text or "")
+        -- trim whitespace
+        local trimmed = raw:match("^%s*(.-)%s*$") or raw
+        Webhook.url = trimmed
+        -- Update visible mirror for readability
+        WebhookUrlParagraph:Set({
+            Title = "Current Webhook URL",
+            Content = (#trimmed > 0) and trimmed or "(none)"
+        })
+    end,
+})
+
+local WebhookIntervalSlider = SettingsTab:CreateSlider({
+    Name = "Report Interval (sec)",
+    Range = {30, 3600},
+    Increment = 10,
+    CurrentValue = 300,
+    Flag = "WebhookInterval",
+    Callback = function(value)
+        Webhook.interval = value
+    end,
+})
+
+local function BuildDiscordEmbed()
+    local currentMoney = Statistics:GetCurrentMoney()
+    local uptime = Statistics:GetUptime()
+    local spent = Statistics.spent or 0
+    local gained = Statistics.gained or 0
+    local seedsSummary = Statistics:GetSeedPurchasesSummary(10)
+
+    return {
+        title = "Auto Farm Status",
+        color = 0x33AAFF,
+        fields = {
+            { name = "Uptime", value = uptime, inline = true },
+            { name = "Current Money", value = Utils.FormatCurrency(currentMoney), inline = true },
+            { name = "Money Spent", value = Utils.FormatCurrency(spent), inline = true },
+            { name = "Money Gained", value = Utils.FormatCurrency(gained), inline = true },
+            { name = "Seeds Bought", value = seedsSummary, inline = false },
+        },
+        timestamp = DateTime.now():ToIsoDate(),
+    }
+end
+
+local function IsValidDiscordWebhook(url)
+    if type(url) ~= "string" then return false end
+    -- normalize whitespace
+    url = url:match("^%s*(.-)%s*$") or url
+    -- Allow only Discord webhook endpoints (any subdomain of discord.com or legacy discordapp.com)
+    if url:match("^https://[%w%%-%.]*discord%.com/api/webhooks/") then return true end
+    if url:match("^https://[%w%%-%.]*discordapp%.com/api/webhooks/") then return true end
+    return false
+end
+
+local function SendDiscordWebhook()
+    if not Webhook.url or Webhook.url == "" then return false end
+    if not IsValidDiscordWebhook(Webhook.url) then
+        warn("Webhook blocked: invalid domain")
+        Rayfield:Notify({
+            Title = "Webhook Blocked",
+            Content = "Invalid webhook domain. Use discord.com/discordapp.com",
+            Duration = 4,
+            Image = 4483362458,
+        })
+        return false
+    end
+    local payload = {
+        content = nil,
+        embeds = { BuildDiscordEmbed() },
+    }
+    local ok, res = pcall(function()
+        return HttpService:RequestAsync({
+            Url = Webhook.url,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = HttpService:JSONEncode(payload),
+        })
+    end)
+    if not ok or not res or res.Success ~= true then
+        if res and res.StatusCode then
+            warn("Discord webhook failed: status ", res.StatusCode)
+        end
+        return false
+    end
+    return true
+end
+
+local function StartWebhookLoop()
+    if Webhook.running then return end
+    Webhook.running = true
+    task.spawn(function()
+        while Webhook.enabled do
+            local sent = SendDiscordWebhook()
+            if not sent then
+                -- disable on failure to avoid spam and potential vulnerability
+                Webhook.enabled = false
+                if WebhookToggle then pcall(function() WebhookToggle:Set(false) end) end
+                break
+            end
+            task.wait(math.max(10, tonumber(Webhook.interval) or 300))
+        end
+        Webhook.running = false
+    end)
+end
+
+local WebhookToggle = SettingsTab:CreateToggle({
+    Name = "Enable Discord Reports",
+    CurrentValue = false,
+    Flag = "EnableDiscordWebhook",
+    Callback = function(value)
+        Webhook.enabled = value
+        if value then
+            StartWebhookLoop()
+        end
+    end,
+})
+
+local WebhookTestButton = SettingsTab:CreateButton({
+    Name = "Send Test Report",
+    Callback = function()
+        SendDiscordWebhook()
+        Rayfield:Notify({
+            Title = "Webhook",
+            Content = "Test report sent (check your channel)",
+            Duration = 3,
+            Image = 4483362458,
+        })
+    end,
+})
 
 print("Enhanced Auto Farm V2.0 loaded successfully!")
 Rayfield:Notify({
