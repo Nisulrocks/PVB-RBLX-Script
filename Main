@@ -1,0 +1,834 @@
+-- Enhanced Auto Farm System V2.0
+-- Modular, Optimized, Feature-Rich
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local PathfindingService = game:GetService("PathfindingService")
+
+-- Services & Remotes
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local BuyItemRemote = Remotes:WaitForChild("BuyItem")
+local BuyGearRemote = Remotes:WaitForChild("BuyGear")
+local AttacksRemote = Remotes:WaitForChild("AttacksServer"):WaitForChild("WeaponAttack")
+
+-- Assets
+local SeedsFolder = ReplicatedStorage:WaitForChild("Assets"):WaitForChild("Seeds")
+local GearsFolder = ReplicatedStorage:WaitForChild("Assets"):WaitForChild("Gears")
+local Brainrots = workspace:WaitForChild("ScriptedMap"):WaitForChild("Brainrots")
+
+-- Player
+local LocalPlayer = Players.LocalPlayer
+local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
+local Humanoid = Character:WaitForChild("Humanoid")
+
+-- Update character references on respawn
+LocalPlayer.CharacterAdded:Connect(function(char)
+	Character = char
+	HumanoidRootPart = char:WaitForChild("HumanoidRootPart")
+	Humanoid = char:WaitForChild("Humanoid")
+end)
+
+-----------------------
+-- UTILITY MODULE
+-----------------------
+local Utils = {}
+
+function Utils.SafeFireServer(remote, arg1, arg2)
+	local success, err = pcall(function()
+		if arg2 ~= nil then
+			remote:FireServer(arg1, arg2)
+		elseif arg1 ~= nil then
+			remote:FireServer(arg1)
+		else
+			remote:FireServer()
+		end
+	end)
+	if not success then
+		warn("Remote call failed:", err)
+	end
+	return success
+end
+
+function Utils.GetVisibleSeeds()
+	local list = {}
+	for _, s in ipairs(SeedsFolder:GetChildren()) do
+		if not s:GetAttribute("Hidden") then
+			table.insert(list, s)
+		end
+	end
+	return list
+end
+
+function Utils.GetShopGears()
+	local list = {}
+	for _, g in ipairs(GearsFolder:GetChildren()) do
+		if g:GetAttribute("Price") ~= nil then
+			table.insert(list, g)
+		end
+	end
+	return list
+end
+
+function Utils.SortByPrice(items, descending)
+	table.sort(items, function(a, b)
+		local priceA = a:GetAttribute("Price") or 0
+		local priceB = b:GetAttribute("Price") or 0
+		if descending then
+			return priceA > priceB
+		else
+			return priceA < priceB
+		end
+	end)
+	return items
+end
+
+function Utils.GetTopItems(items, count)
+	local sorted = Utils.SortByPrice(items, true)
+	local result = {}
+	for i = 1, math.min(count, #sorted) do
+		table.insert(result, sorted[i])
+	end
+	return result
+end
+
+function Utils.FormatCurrency(amount)
+	if amount >= 1e9 then
+		return string.format("%.2fB", amount / 1e9)
+	elseif amount >= 1e6 then
+		return string.format("%.2fM", amount / 1e6)
+	elseif amount >= 1e3 then
+		return string.format("%.2fK", amount / 1e3)
+	else
+		return tostring(amount)
+	end
+end
+
+-----------------------
+-- SEED PREDICTION DATA
+-----------------------
+local SeedChances = {
+	["Dragon Fruit Seed"] = {33, 5, 2},
+	["Eggplant Seed"] = {10},
+	["Watermelon Seed"] = {5},
+	["Grape Seed"] = {3.5},
+	["Cocotank Seed"] = {2},
+	["Carnivorous Plant Seed"] = {1.5},
+	["Pine-a-Punch Seed"] = {1.25},
+	["Mr Carrot Seed"] = {1},
+	["Tomatrio Seed"] = {0.75},
+	["Shroombino Seed"] = {0.5},
+	["Mango Seed"] = {0.267},
+}
+
+local function GetSeedProbability(seedName)
+	local chances = SeedChances[seedName]
+	if chances and #chances > 0 then
+		local sum = 0
+		for _, v in ipairs(chances) do sum = sum + v end
+		return sum / #chances / 100
+	end
+	return 1
+end
+
+-----------------------
+-- AUTO BUYER MODULE
+-----------------------
+local AutoBuyer = {}
+AutoBuyer.__index = AutoBuyer
+
+function AutoBuyer.new(itemType, folder, buyRemote, buyDelay)
+	local self = setmetatable({}, AutoBuyer)
+	self.itemType = itemType
+	self.folder = folder
+	self.buyRemote = buyRemote
+	self.buyDelay = buyDelay or 0.08
+	self.running = false
+	self.modes = {
+		selected = false,
+		all = false,
+		best = false
+	}
+	self.selectedItems = {}
+	self.topCount = 3
+	self.purchaseCount = 0
+	self.totalSpent = 0
+	return self
+end
+
+function AutoBuyer:GetItems()
+	if self.itemType == "seed" then
+		return Utils.GetVisibleSeeds()
+	else
+		return Utils.GetShopGears()
+	end
+end
+
+function AutoBuyer:DeterminePurchaseList()
+	local items = {}
+	
+	if self.modes.all then
+		items = self:GetItems()
+	elseif self.modes.best then
+		items = Utils.GetTopItems(self:GetItems(), self.topCount)
+	elseif self.modes.selected then
+		for _, name in ipairs(self.selectedItems) do
+			local inst = self.folder:FindFirstChild(name)
+			if inst then
+				if self.itemType == "seed" and not inst:GetAttribute("Hidden") then
+					table.insert(items, inst)
+				elseif self.itemType == "gear" and inst:GetAttribute("Price") ~= nil then
+					table.insert(items, inst)
+				end
+			end
+		end
+	end
+	
+	return items
+end
+
+function AutoBuyer:BuyItem(item)
+	local stock = item:GetAttribute("Stock") or 0
+	local price = item:GetAttribute("Price") or 0
+	
+	local actualPurchases = 0
+	
+	if stock > 0 then
+		for i = 1, stock do
+			local success = Utils.SafeFireServer(self.buyRemote, item.Name, true)
+			if success then
+				actualPurchases = actualPurchases + 1
+			end
+			task.wait(self.buyDelay)
+		end
+	end
+	
+	-- Only increment counters if we actually made purchases
+	if actualPurchases > 0 then
+		self.purchaseCount = self.purchaseCount + actualPurchases
+		self.totalSpent = self.totalSpent + (price * actualPurchases)
+	end
+	
+	return actualPurchases
+end
+
+function AutoBuyer:Start()
+	if self.running then return end
+	self.running = true
+	
+	task.spawn(function()
+		while self.modes.selected or self.modes.all or self.modes.best do
+			local itemsToBuy = self:DeterminePurchaseList()
+			
+			-- Only buy if items actually have stock
+			local itemsWithStock = {}
+			for _, item in ipairs(itemsToBuy) do
+				if (item:GetAttribute("Stock") or 0) > 0 then
+					table.insert(itemsWithStock, item)
+				end
+			end
+			
+			-- Only attempt purchases if there's stock available
+			if #itemsWithStock > 0 then
+				for _, item in ipairs(itemsWithStock) do
+					if not self.running then break end
+					self:BuyItem(item)
+				end
+			end
+			
+			task.wait(3)
+		end
+		self.running = false
+	end)
+end
+
+function AutoBuyer:Stop()
+	self.running = false
+	for k, _ in pairs(self.modes) do
+		self.modes[k] = false
+	end
+end
+
+function AutoBuyer:GetStats()
+	return {
+		purchases = self.purchaseCount,
+		spent = self.totalSpent
+	}
+end
+
+-----------------------
+-- AUTO COMBAT MODULE (Based on original working code)
+-----------------------
+local AutoCombat = {}
+AutoCombat.__index = AutoCombat
+
+function AutoCombat.new()
+	local self = setmetatable({}, AutoCombat)
+	self.enabled = false
+	self.attackDelay = 0.1
+	self.attackRange = 10
+	self.running = false
+	self.highlightEnabled = true
+	self.currentOutline = nil
+	self.currentTarget = nil
+	self.lastTarget = nil
+	self.originalColors = {}
+	self.weaponSlot = 1
+	self.equippedTool = nil
+	return self
+end
+
+function AutoCombat:GetNearestEnemy()
+	local nearest = nil
+	local nearestDist = math.huge
+	
+	for _, enemy in ipairs(Brainrots:GetChildren()) do
+		local enemyHRP = enemy:FindFirstChild("HumanoidRootPart") or enemy.PrimaryPart
+		if enemyHRP then
+			local dist = (HumanoidRootPart.Position - enemyHRP.Position).Magnitude
+			if dist < nearestDist then
+				nearestDist = dist
+				nearest = enemy
+			end
+		end
+	end
+	
+	return nearest
+end
+
+function AutoCombat:HighlightEnemy(enemy)
+	-- Remove old highlight
+	self:RemoveHighlight()
+	
+	if self.highlightEnabled and enemy and enemy:IsDescendantOf(workspace) then
+		-- Store original colors
+		for _, part in ipairs(enemy:GetDescendants()) do
+			if part:IsA("BasePart") then
+				self.originalColors[part] = {
+					Color = part.Color,
+					Transparency = part.Transparency
+				}
+				-- Set to transparent red
+				part.Color = Color3.fromRGB(255, 0, 0)
+				part.Transparency = 0.5
+			end
+		end
+	end
+end
+
+function AutoCombat:RemoveHighlight()
+	-- Restore original colors
+	for part, original in pairs(self.originalColors) do
+		if part and part.Parent then
+			part.Color = original.Color
+			part.Transparency = original.Transparency
+		end
+	end
+	self.originalColors = {}
+end
+
+function AutoCombat:MoveToTarget(target)
+	local targetHRP = target:FindFirstChild("HumanoidRootPart") or target.PrimaryPart
+	if not targetHRP then return end
+	
+	task.spawn(function()
+		while self.enabled and target.Parent do
+			Humanoid:MoveTo(targetHRP.Position)
+			task.wait(0.1)
+		end
+	end)
+end
+
+function AutoCombat:Start()
+	if self.running then return end
+	self.running = true
+	self.enabled = true
+	
+	task.spawn(function()
+		local lastEnemy = nil
+		while self.enabled do
+			local enemy = self:GetNearestEnemy()
+			
+			-- Update current target for stats display
+			self.currentTarget = enemy
+			
+			if enemy ~= lastEnemy then
+				lastEnemy = enemy
+				self:HighlightEnemy(enemy)
+			end
+			
+			if enemy then
+				self:MoveToTarget(enemy)
+				local enemyHRP = enemy:FindFirstChild("HumanoidRootPart") or enemy.PrimaryPart
+				
+				if enemyHRP then
+					-- Track the enemy we're attacking
+					local attackingEnemy = enemy
+					
+					while enemy.Parent and self.enabled and enemyHRP.Parent do
+						local distance = (HumanoidRootPart.Position - enemyHRP.Position).Magnitude
+						if distance > self.attackRange then break end
+						
+						pcall(function()
+							AttacksRemote:FireServer({enemy.Name})
+						end)
+						task.wait(self.attackDelay)
+					end
+				end
+			else
+				-- No enemy found, remove highlight
+				self:RemoveHighlight()
+				lastEnemy = nil
+			end
+			
+			-- Ensure highlight respects toggle even while moving
+			if self.highlightEnabled and lastEnemy then
+				self:HighlightEnemy(lastEnemy)
+			else
+				self:RemoveHighlight()
+			end
+			
+			task.wait(0.1)
+		end
+		
+		self.running = false
+		self.currentTarget = nil
+		self:RemoveHighlight()
+	end)
+end
+
+function AutoCombat:Stop()
+	self.enabled = false
+	self:RemoveHighlight()
+end
+
+function AutoCombat:GetStats()
+	return {
+		target = self.currentTarget
+	}
+end
+
+-----------------------
+-- STATISTICS TRACKER
+-----------------------
+local Statistics = {
+	sessionStart = tick()
+}
+
+function Statistics:GetUptime()
+	local uptime = tick() - self.sessionStart
+	local hours = math.floor(uptime / 3600)
+	local minutes = math.floor((uptime % 3600) / 60)
+	local seconds = math.floor(uptime % 60)
+	return string.format("%02dh %02dm %02ds", hours, minutes, seconds)
+end
+
+function Statistics:GenerateReport()
+	return string.format(
+		"Session Stats:\n" ..
+		"Uptime: %s\n",
+		self:GetUptime()
+	)
+end
+
+-----------------------
+-- RAYFIELD UI SETUP
+-----------------------
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+local Window = Rayfield:CreateWindow({
+	Name = "Enhanced Auto Farm V2.0",
+	LoadingTitle = "Elite Farming System",
+	LoadingSubtitle = "by Nisul | Optimized & Enhanced",
+	ConfigurationSaving = {
+		Enabled = true,
+		FolderName = "EnhancedAutoFarm",
+		FileName = "AutoFarmConfig_V2"
+	}
+})
+
+-----------------------
+-- DASHBOARD TAB
+-----------------------
+local DashboardTab = Window:CreateTab("Dashboard", 4483362458)
+local StatsSection = DashboardTab:CreateSection("Session Statistics")
+
+local StatsParagraph = DashboardTab:CreateParagraph({
+	Title = "Statistics",
+	Content = "Initializing..."
+})
+
+-- Update stats every 5 seconds
+task.spawn(function()
+	while true do
+		StatsParagraph:Set({
+			Title = "Session Statistics",
+			Content = Statistics:GenerateReport()
+		})
+		task.wait(5)
+	end
+end)
+
+-----------------------
+-- SEED BUYER TAB
+-----------------------
+local SeedTab = Window:CreateTab("Seed Buyer", 4483362458)
+local SeedSection = SeedTab:CreateSection("Auto Seed Purchasing")
+
+local seedBuyer = AutoBuyer.new("seed", SeedsFolder, BuyItemRemote, 0.08)
+
+local seedNamesList = {}
+for _, s in ipairs(Utils.GetVisibleSeeds()) do
+	table.insert(seedNamesList, s.Name)
+end
+
+local SeedDropdown = SeedTab:CreateDropdown({
+	Name = "Select Seeds to Buy",
+	Options = seedNamesList,
+	MultipleOptions = true,
+	CurrentOption = {},
+	Flag = "SeedDropdown",
+	Callback = function(selected)
+		seedBuyer.selectedItems = selected or {}
+	end,
+})
+
+local SeedTopSlider = SeedTab:CreateSlider({
+	Name = "Top X Seeds (by Price)",
+	Range = {1, 15},
+	Increment = 1,
+	CurrentValue = 3,
+	Flag = "TopSeedCount",
+	Callback = function(value)
+		seedBuyer.topCount = value
+	end,
+})
+
+local BestSeedsParagraph = SeedTab:CreateParagraph({
+	Title = "Best Seeds Preview",
+	Content = "Select 'Auto Buy Best Seeds' to see preview"
+})
+
+local SeedToggleSelected = SeedTab:CreateToggle({
+	Name = "Auto Buy Selected Seeds",
+	CurrentValue = false,
+	Flag = "AutoBuySelectedSeeds",
+	Callback = function(value)
+		seedBuyer.modes.selected = value
+		if value then seedBuyer:Start() end
+	end,
+})
+
+local SeedToggleAll = SeedTab:CreateToggle({
+	Name = "Auto Buy All Seeds",
+	CurrentValue = false,
+	Flag = "AutoBuyAllSeeds",
+	Callback = function(value)
+		seedBuyer.modes.all = value
+		if value then seedBuyer:Start() end
+	end,
+})
+
+local SeedToggleBest = SeedTab:CreateToggle({
+	Name = "Auto Buy Best Seeds",
+	CurrentValue = false,
+	Flag = "AutoBuyBestSeeds",
+	Callback = function(value)
+		seedBuyer.modes.best = value
+		if value then
+			seedBuyer:Start()
+			-- Update preview
+			task.spawn(function()
+				while seedBuyer.modes.best do
+					local best = Utils.GetTopItems(Utils.GetVisibleSeeds(), seedBuyer.topCount)
+					if #best > 0 then
+						local txt = string.format("Top %d Seeds:\n\n", seedBuyer.topCount)
+						for i, inst in ipairs(best) do
+							txt = txt .. string.format(
+								"%d. %s\n   Price: %s | Stock: %d\n",
+								i,
+								inst.Name,
+								Utils.FormatCurrency(inst:GetAttribute("Price") or 0),
+								inst:GetAttribute("Stock") or 0
+							)
+						end
+						BestSeedsParagraph:Set({Title = "Best Seeds Preview", Content = txt})
+					end
+					task.wait(5)
+				end
+			end)
+		end
+	end,
+})
+
+-- Seed Predictions
+local SeedPredSection = SeedTab:CreateSection("Stock Predictions")
+
+local PredictionsParagraph = SeedTab:CreateParagraph({
+	Title = "Predicted Stock (Next Refresh)",
+	Content = "Calculating..."
+})
+
+local function UpdateSeedPredictions()
+	local predictions = {}
+	for _, s in ipairs(Utils.GetVisibleSeeds()) do
+		local prob = GetSeedProbability(s.Name)
+		local maxStock = s:GetAttribute("Stock") or 1
+		local expected = math.floor(prob * maxStock + 0.5)
+		table.insert(predictions, {
+			name = s.Name,
+			expected = expected,
+			probability = prob * 100
+		})
+	end
+	
+	table.sort(predictions, function(a, b) return a.expected > b.expected end)
+	
+	local txt = ""
+	for i, pred in ipairs(predictions) do
+		txt = txt .. string.format(
+			"%d. %s\n   Expected: %d units (%.1f%% chance)\n",
+			i,
+			pred.name,
+			pred.expected,
+			pred.probability
+		)
+	end
+	
+	PredictionsParagraph:Set({
+		Title = "Predicted Stock (Next Refresh)",
+		Content = txt
+	})
+end
+
+task.spawn(function()
+	while true do
+		UpdateSeedPredictions()
+		task.wait(300)
+	end
+end)
+UpdateSeedPredictions()
+
+-----------------------
+-- GEAR BUYER TAB
+-----------------------
+local GearTab = Window:CreateTab("Gear Buyer", 4483362458)
+local GearSection = GearTab:CreateSection("Auto Gear Purchasing")
+
+local gearBuyer = AutoBuyer.new("gear", GearsFolder, BuyGearRemote, 0.12)
+
+local gearNamesList = {}
+for _, g in ipairs(Utils.GetShopGears()) do
+	table.insert(gearNamesList, g.Name)
+end
+
+local GearDropdown = GearTab:CreateDropdown({
+	Name = "Select Gears to Buy",
+	Options = gearNamesList,
+	MultipleOptions = true,
+	CurrentOption = {},
+	Flag = "GearDropdown",
+	Callback = function(opts)
+		gearBuyer.selectedItems = opts or {}
+	end,
+})
+
+local GearTopSlider = GearTab:CreateSlider({
+	Name = "Top X Gears (by Price)",
+	Range = {1, 15},
+	Increment = 1,
+	CurrentValue = 3,
+	Flag = "TopGearCount",
+	Callback = function(value)
+		gearBuyer.topCount = value
+	end,
+})
+
+local BestGearsParagraph = GearTab:CreateParagraph({
+	Title = "Best Gears Preview",
+	Content = "Select 'Auto Buy Best Gears' to see preview"
+})
+
+local GearToggleSelected = GearTab:CreateToggle({
+	Name = "Auto Buy Selected Gears",
+	CurrentValue = false,
+	Flag = "AutoBuySelectedGears",
+	Callback = function(value)
+		gearBuyer.modes.selected = value
+		if value then gearBuyer:Start() end
+	end,
+})
+
+local GearToggleAll = GearTab:CreateToggle({
+	Name = "Auto Buy All Gears",
+	CurrentValue = false,
+	Flag = "AutoBuyAllGears",
+	Callback = function(value)
+		gearBuyer.modes.all = value
+		if value then gearBuyer:Start() end
+	end,
+})
+
+local GearToggleBest = GearTab:CreateToggle({
+	Name = "Auto Buy Best Gears",
+	CurrentValue = false,
+	Flag = "AutoBuyBestGears",
+	Callback = function(value)
+		gearBuyer.modes.best = value
+		if value then
+			gearBuyer:Start()
+			-- Update preview
+			task.spawn(function()
+				while gearBuyer.modes.best do
+					local best = Utils.GetTopItems(Utils.GetShopGears(), gearBuyer.topCount)
+					if #best > 0 then
+						local txt = string.format("Top %d Gears:\n\n", gearBuyer.topCount)
+						for i, inst in ipairs(best) do
+							txt = txt .. string.format(
+								"%d. %s\n   Price: %s | Stock: %d\n",
+								i,
+								inst.Name,
+								Utils.FormatCurrency(inst:GetAttribute("Price") or 0),
+								inst:GetAttribute("Stock") or 0
+							)
+						end
+						BestGearsParagraph:Set({Title = "Best Gears Preview", Content = txt})
+					end
+					task.wait(5)
+				end
+			end)
+		end
+	end,
+})
+
+-----------------------
+-- COMBAT TAB
+-----------------------
+local CombatTab = Window:CreateTab("Auto Combat", 4483362458)
+local CombatSection = CombatTab:CreateSection("Enemy Auto Attack")
+
+local combat = AutoCombat.new()
+
+local CombatToggle = CombatTab:CreateToggle({
+	Name = "Auto Attack Enemies",
+	CurrentValue = false,
+	Flag = "AutoAttackEnabled",
+	Callback = function(value)
+		if value then
+			combat:Start()
+		else
+			combat:Stop()
+		end
+	end,
+})
+
+local AttackDelaySlider = CombatTab:CreateSlider({
+	Name = "Attack Delay (seconds)",
+	Range = {0.05, 1},
+	Increment = 0.01,
+	CurrentValue = 0.1,
+	Flag = "AttackDelay",
+	Callback = function(value)
+		combat.attackDelay = value
+	end,
+})
+
+local AttackRangeSlider = CombatTab:CreateSlider({
+	Name = "Attack Range",
+	Range = {5, 30},
+	Increment = 1,
+	CurrentValue = 10,
+	Flag = "AttackRange",
+	Callback = function(value)
+		combat.attackRange = value
+	end,
+})
+
+local HighlightToggle = CombatTab:CreateToggle({
+	Name = "Highlight Target (Transparent Red)",
+	CurrentValue = true,
+	Flag = "HighlightTarget",
+	Callback = function(value)
+		combat.highlightEnabled = value
+		if not value then
+			combat:RemoveHighlight()
+		end
+	end,
+})
+
+local CombatStatsParagraph = CombatTab:CreateParagraph({
+	Title = "Combat Statistics",
+	Content = "No target"
+})
+
+task.spawn(function()
+	while true do
+		if combat.enabled then
+			local targetName = "None"
+			if combat.currentTarget and combat.currentTarget.Parent then
+				targetName = combat.currentTarget.Name
+			end
+			CombatStatsParagraph:Set({
+				Title = "Combat Statistics",
+				Content = string.format("Current Target: %s", targetName)
+			})
+		end
+		task.wait(1)
+	end
+end)
+
+-----------------------
+-- SETTINGS TAB
+-----------------------
+local SettingsTab = Window:CreateTab("Settings", 4483362458)
+local SettingsSection = SettingsTab:CreateSection("Configuration")
+
+local SeedDelaySlider = SettingsTab:CreateSlider({
+	Name = "Seed Buy Delay (seconds)",
+	Range = {0.05, 0.5},
+	Increment = 0.01,
+	CurrentValue = 0.08,
+	Flag = "SeedBuyDelay",
+	Callback = function(value)
+		seedBuyer.buyDelay = value
+	end,
+})
+
+local GearDelaySlider = SettingsTab:CreateSlider({
+	Name = "Gear Buy Delay (seconds)",
+	Range = {0.05, 0.5},
+	Increment = 0.01,
+	CurrentValue = 0.12,
+	Flag = "GearBuyDelay",
+	Callback = function(value)
+		gearBuyer.buyDelay = value
+	end,
+})
+
+local StopAllButton = SettingsTab:CreateButton({
+	Name = "Emergency Stop All",
+	Callback = function()
+		seedBuyer:Stop()
+		gearBuyer:Stop()
+		combat:Stop()
+		Rayfield:Notify({
+			Title = "Emergency Stop",
+			Content = "All auto-farm functions stopped",
+			Duration = 3,
+			Image = 4483362458,
+		})
+	end,
+})
+
+-----------------------
+-- UPDATE STATISTICS
+-----------------------
+-- Statistics update removed - only uptime tracked now
+
+print("Enhanced Auto Farm V2.0 loaded successfully!")
+Rayfield:Notify({
+	Title = "System Ready",
+	Content = "Enhanced Auto Farm V2.0 initialized",
+	Duration = 5,
+	Image = 4483362458,
+})
