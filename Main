@@ -190,42 +190,61 @@ function AutoBuyer:BuyItem(item)
     local price = item:GetAttribute("Price") or 0
     
     local actualPurchases = 0
-    
+
     if stock > 0 then
-        for i = 1, stock do
-            local priceNumber = tonumber(price) or 0
-            local moneyBefore, stockBefore
-            if Statistics and Statistics.GetCurrentMoney then
-                moneyBefore = Statistics:GetCurrentMoney()
+        local priceNumber = tonumber(price) or 0
+        local originalStock = stock
+        local maxRetries = 3
+
+        for attempt = 1, maxRetries do
+            local remaining = tonumber(item:GetAttribute("Stock")) or 0
+            if remaining <= 0 then break end
+
+            -- Fire for current remaining stock
+            for i = 1, remaining do
+                Utils.SafeFireServer(self.buyRemote, item.Name, true)
+                task.wait(self.buyDelay)
             end
-            stockBefore = tonumber(item:GetAttribute("Stock")) or 0
 
-            local success = Utils.SafeFireServer(self.buyRemote, item.Name, true)
+            -- Grace period to allow server replication (longer window)
+            local graceTotal = 3.5
+            local step = math.max(0.05, self.buyDelay)
+            local waited = 0
+            while waited < graceTotal do
+                task.wait(step)
+                waited += step
+            end
 
-            task.wait(self.buyDelay)
+            -- Compute delta since this attempt
+            local moneyNow = (Statistics and Statistics.GetCurrentMoney and Statistics:GetCurrentMoney()) or nil
+            local stockNow = tonumber(item:GetAttribute("Stock")) or remaining
 
-            local confirmed = false
-            if success then
-                -- Confirm by money delta for paid items
-                if priceNumber > 0 and moneyBefore ~= nil and Statistics and Statistics.GetCurrentMoney then
-                    local moneyAfter = Statistics:GetCurrentMoney()
-                    local spentDelta = (moneyBefore - moneyAfter)
-                    if spentDelta >= priceNumber then
-                        confirmed = true
-                    end
+            local confirmedThisAttempt = 0
+            if priceNumber > 0 and moneyNow ~= nil then
+                -- Approximate purchases from total spent since last attempt boundary
+                -- We don't know the exact boundary money, so infer from remaining vs before if price checks fail
+                -- Prefer stock delta if it decreased
+                local newRemaining = stockNow
+                if newRemaining < remaining then
+                    confirmedThisAttempt = remaining - newRemaining
                 else
-                    -- Free items: confirm by stock decreasing
-                    local stockAfter = tonumber(item:GetAttribute("Stock")) or stockBefore
-                    if stockAfter < stockBefore then
-                        confirmed = true
-                    end
+                    -- Fallback: estimate via money delta over price (best-effort)
+                    -- Note: Without a precise per-attempt money baseline, we cannot isolate per-attempt spend reliably
+                    -- so we skip money-based inference here to avoid overcounting.
+                end
+            else
+                -- Free items: use stock delta
+                if stockNow < remaining then
+                    confirmedThisAttempt = remaining - stockNow
                 end
             end
 
-            if confirmed then
-                actualPurchases = actualPurchases + 1
-            else
-                -- No confirmation: likely out of stock or failed. Stop trying this item.
+            -- Clamp and accumulate
+            confirmedThisAttempt = math.max(0, math.min(confirmedThisAttempt, remaining))
+            actualPurchases = actualPurchases + confirmedThisAttempt
+
+            -- Stop conditions: no progress or nothing left
+            if confirmedThisAttempt == 0 or actualPurchases >= originalStock or stockNow <= 0 then
                 break
             end
         end
@@ -253,23 +272,11 @@ function AutoBuyer:Start()
 	task.spawn(function()
 		while self.modes.selected or self.modes.all or self.modes.best do
 			local itemsToBuy = self:DeterminePurchaseList()
-			
-			-- Only buy if items actually have stock
-			local itemsWithStock = {}
+			-- Try each item; BuyItem has its own confirmation and will stop per item when out of stock
 			for _, item in ipairs(itemsToBuy) do
-				if (item:GetAttribute("Stock") or 0) > 0 then
-					table.insert(itemsWithStock, item)
-				end
+				if not self.running then break end
+				self:BuyItem(item)
 			end
-			
-			-- Only attempt purchases if there's stock available
-			if #itemsWithStock > 0 then
-				for _, item in ipairs(itemsWithStock) do
-					if not self.running then break end
-					self:BuyItem(item)
-				end
-			end
-			
 			task.wait(3)
 		end
 		self.running = false
