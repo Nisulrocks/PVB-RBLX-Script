@@ -283,12 +283,7 @@ function AutoBuyer:BuyItem(item)
     if actualPurchases > 0 then
         self.purchaseCount = self.purchaseCount + actualPurchases
         self.totalSpent = self.totalSpent + (price * actualPurchases)
-        -- Record seed purchases for dashboard/webhook stats (guarded)
-        if self.itemType == "seed" then
-            if Statistics and Statistics.RecordSeedPurchase then
-                Statistics:RecordSeedPurchase(item.Name, actualPurchases)
-            end
-        end
+        -- Do not record seed purchases here; backpack-based tracker will handle counts
     end
     
     return actualPurchases
@@ -539,6 +534,8 @@ Statistics = {
     spent = 0,
     gained = 0,
     seedPurchases = {},
+    seedBaseline = {},
+    seedLastSeen = {},
 }
 
 function Statistics:InitMoneyTracker()
@@ -560,6 +557,57 @@ function Statistics:GetCurrentMoney()
         return tonumber(moneyVal.Value) or 0
     end
     return 0
+end
+
+-- Backpack-based seed purchase tracker using ItemName + Uses
+function Statistics:_buildVisibleSeedSet()
+    local valid = {}
+    for _, seed in ipairs(SeedsFolder:GetChildren()) do
+        if not seed:GetAttribute("Hidden") then
+            valid[seed.Name] = true
+        end
+    end
+    return valid
+end
+
+function Statistics:_readBackpackSeedCounts()
+    local counts = {}
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    if not backpack then return counts end
+    local valid = self:_buildVisibleSeedSet()
+    for _, inst in ipairs(backpack:GetChildren()) do
+        local itemName = inst:GetAttribute("ItemName")
+        local uses = inst:GetAttribute("Uses")
+        if itemName and uses ~= nil and valid[itemName] then
+            counts[itemName] = (counts[itemName] or 0) + (tonumber(uses) or 0)
+        end
+    end
+    return counts
+end
+
+function Statistics:InitSeedBaseline()
+    self.seedBaseline = {}
+    self.seedLastSeen = {}
+    local now = self:_readBackpackSeedCounts()
+    for name, cnt in pairs(now) do
+        self.seedBaseline[name] = cnt
+        self.seedLastSeen[name] = cnt
+    end
+end
+
+function Statistics:UpdateSeedPurchasesFromBackpack()
+    if not next(self.seedBaseline) then
+        self:InitSeedBaseline()
+    end
+    local current = self:_readBackpackSeedCounts()
+    for name, curr in pairs(current) do
+        local last = self.seedLastSeen[name] or curr
+        if curr > last then
+            local delta = curr - last
+            self.seedPurchases[name] = (self.seedPurchases[name] or 0) + delta
+        end
+        self.seedLastSeen[name] = curr
+    end
 end
 
 function Statistics:RecordSeedPurchase(name, count)
@@ -657,12 +705,76 @@ task.spawn(function()
 	while true do
 		-- Track money deltas each tick
 		Statistics:UpdateMoney()
+		-- Update seed purchases based on Backpack ItemName/Uses deltas
+		Statistics:UpdateSeedPurchasesFromBackpack()
 		StatsParagraph:Set({
 			Title = "Session Statistics",
 			Content = Statistics:GenerateReport()
 		})
 		task.wait(1)
 	end
+end)
+
+-----------------------
+-- SEED BUYER TAB
+-----------------------
+-----------------------
+-- BACKPACK TAB
+-----------------------
+local BackpackTab = Window:CreateTab("Backpack", 4483362458)
+local BackpackSection = BackpackTab:CreateSection("Player Seeds (Backpack)")
+
+local BackpackParagraph = BackpackTab:CreateParagraph({
+    Title = "Backpack Seeds",
+    Content = "Scanning..."
+})
+
+local function BuildBackpackSeedSummary()
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    if not backpack then
+        return "Backpack not found"
+    end
+
+    -- Build allowlist of visible seeds from ReplicatedStorage.Assets.Seeds
+    local valid = {}
+    for _, seed in ipairs(SeedsFolder:GetChildren()) do
+        if not seed:GetAttribute("Hidden") then
+            valid[seed.Name] = true
+        end
+    end
+
+    -- Sum Uses by ItemName attribute (backpack tools may be named like "[x2] Carrot Seed")
+    local counts = {}
+    for _, inst in ipairs(backpack:GetChildren()) do
+        -- Match using ItemName attribute instead of Instance.Name
+        local itemName = inst:GetAttribute("ItemName")
+        local uses = inst:GetAttribute("Uses")
+        if itemName and uses ~= nil and valid[itemName] then
+            counts[itemName] = (counts[itemName] or 0) + (tonumber(uses) or 0)
+        end
+    end
+
+    -- Format output
+    local lines = {}
+    for name, count in pairs(counts) do
+        table.insert(lines, string.format("- %s: %d", name, count))
+    end
+    table.sort(lines) -- alphabetical
+    if #lines == 0 then
+        return "No visible seeds found in Backpack (with Uses attribute)."
+    end
+    return table.concat(lines, "\n")
+end
+
+task.spawn(function()
+    while true do
+        local summary = BuildBackpackSeedSummary()
+        BackpackParagraph:Set({
+            Title = "Backpack Seeds",
+            Content = summary
+        })
+        task.wait(2)
+    end
 end)
 
 -----------------------
