@@ -1249,6 +1249,7 @@ local WebhookUrlBox = SettingsTab:CreateInput({
     Name = "Webhook URL",
     PlaceholderText = "https://discord.com/api/webhooks/...",
     RemoveTextAfterFocusLost = false,
+    Flag = "WebhookUrl",
     Callback = function(text)
         local raw = tostring(text or "")
         -- trim whitespace
@@ -1259,8 +1260,45 @@ local WebhookUrlBox = SettingsTab:CreateInput({
             Title = "Current Webhook URL",
             Content = (#trimmed > 0) and trimmed or "(none)"
         })
+        -- Persist URL to disk (if executor supports it)
+        local ok, err = pcall(function()
+            local payload = HttpService:JSONEncode({ url = trimmed })
+            if writefile then
+                local folder = "EnhancedAutoFarm"
+                if makefolder then pcall(function() makefolder(folder) end) end
+                writefile(folder .. "/webhook_url.json", payload)
+            end
+        end)
+        if not ok and err then warn("Failed to save webhook url:", err) end
     end,
 })
+
+local function LoadWebhookUrl()
+    -- Load from disk first (explicit), then fall back to Rayfield-loaded value
+    local loaded = nil
+    pcall(function()
+        if readfile then
+            local path = "EnhancedAutoFarm/webhook_url.json"
+            if isfile and isfile(path) then
+                local data = readfile(path)
+                local obj = HttpService:JSONDecode(data)
+                loaded = type(obj)=="table" and obj.url or nil
+            end
+        end
+    end)
+    -- If explicit load found a value, use it; else try to read current input text via Flag reflection
+    local url = loaded or Webhook.url or ""
+    if type(url) ~= "string" then url = "" end
+    Webhook.url = url
+    -- Reflect in UI (if Rayfield element exposes Set)
+    if WebhookUrlBox and WebhookUrlBox.Set then
+        pcall(function() WebhookUrlBox:Set(url) end)
+    end
+    WebhookUrlParagraph:Set({
+        Title = "Current Webhook URL",
+        Content = (#url > 0) and url or "(none)"
+    })
+end
 
 local WebhookIntervalSlider = SettingsTab:CreateSlider({
     Name = "Report Interval (sec)",
@@ -1379,6 +1417,26 @@ local WebhookTestButton = SettingsTab:CreateButton({
         })
     end,
 })
+
+-- Configuration Save (Load is automatic via Rayfield settings)
+local ConfigSection = SettingsTab:CreateSection("Config Management")
+
+local SaveConfigButton = SettingsTab:CreateButton({
+    Name = "Save Configuration",
+    Callback = function()
+        pcall(function() Rayfield:SaveConfiguration() end)
+        Rayfield:Notify({
+            Title = "Config",
+            Content = "Configuration saved.",
+            Duration = 2,
+            Image = 4483362458,
+        })
+    end,
+})
+
+-- Ensure Rayfield restores saved flags/values and then sync webhook URL
+pcall(function() Rayfield:LoadConfiguration() end)
+LoadWebhookUrl()
 
 print("Enhanced Auto Farm V2.0 loaded successfully!")
 Rayfield:Notify({
