@@ -480,7 +480,6 @@ function AutoCombat:Start()
 			end
 			if enemy then
 				self:MoveToTarget(enemy)
-				local enemyHRP = enemy:FindFirstChild("HumanoidRootPart") or enemy.PrimaryPart
 
 				if enemyHRP then
 					while enemy.Parent and self.enabled and enemyHRP.Parent do
@@ -495,6 +494,22 @@ function AutoCombat:Start()
 				end
 			else
 				-- No enemy found, remove highlight
+
+-- Seed Tracking Controls
+local SeedTrackingSection = SettingsTab:CreateSection("Seed Tracking")
+
+local ResetBaselineButton = SettingsTab:CreateButton({
+    Name = "Reset Seed Baseline",
+    Callback = function()
+        Statistics:ResetSeedBaseline()
+        Rayfield:Notify({
+            Title = "Baseline Reset",
+            Content = "Seed baseline reset. Purchases cleared.",
+            Duration = 3,
+            Image = 4483362458,
+        })
+    end,
+})
 				self:RemoveHighlight()
 				lastEnemy = nil
 			end
@@ -608,6 +623,12 @@ function Statistics:UpdateSeedPurchasesFromBackpack()
         end
         self.seedLastSeen[name] = curr
     end
+end
+
+function Statistics:ResetSeedBaseline()
+    -- Clear session purchases and rebuild baseline from current backpack
+    self.seedPurchases = {}
+    self:InitSeedBaseline()
 end
 
 function Statistics:RecordSeedPurchase(name, count)
@@ -1162,6 +1183,22 @@ local GearDelaySlider = SettingsTab:CreateSlider({
 	Callback = function(value)
 		gearBuyer.buyDelay = value
 	end,
+})
+
+-- Seed Tracking Controls
+local SeedTrackingSection = SettingsTab:CreateSection("Seed Tracking")
+
+local ResetBaselineButton = SettingsTab:CreateButton({
+    Name = "Reset Seed Baseline",
+    Callback = function()
+        Statistics:ResetSeedBaseline()
+        Rayfield:Notify({
+            Title = "Baseline Reset",
+            Content = "Seed baseline reset. Purchases cleared.",
+            Duration = 3,
+            Image = 4483362458,
+        })
+    end,
 })
 
 local StopAllButton = SettingsTab:CreateButton({
